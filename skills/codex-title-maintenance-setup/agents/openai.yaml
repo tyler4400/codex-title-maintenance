@@ -1,0 +1,4 @@
+interface:
+  display_name: "标题维护首次引导"
+  short_description: "首次安装后引导选择默认或自定义配置，说明预览、扫描与自动维护启停。"
+  default_prompt: "使用 $codex-title-maintenance-setup 引导我完成首次配置，并告诉我以后如何使用。"

@@ -1,0 +1,29 @@
+# 这是本 skill 的默认配置模板，不是 Codex 原生 config.toml。
+# init 只复制缺失的文件；后续更新 skill 不覆盖用户配置。
+config_version = 1
+
+[agent]
+model = "gpt-5.6-luna"
+reasoning_effort = "low"
+
+[schedule]
+timezone = "Asia/Shanghai"
+times = ["10:00", "12:00", "15:00", "17:00", "21:00", "23:00"]
+launch_window_minutes = 5
+
+[scan]
+overlap_minutes = 5
+
+[scope]
+include_archived = true
+targets = ["codex", "chat", "work"]
+protect_external_titles = true
+exclude_thread_ids = []
+
+[title]
+template = "{prefix}｜{subject}｜{date}"
+date_source = "latest_assistant"
+date_format = "%m%d"
+language = "zh-CN"
+rules_file = "naming-rules.md"
+prefixes = ["探索", "选型", "环境", "设置", "方案", "实现", "功能", "Bug", "测试", "PR", "检索", "Git", "求知", "生活"]

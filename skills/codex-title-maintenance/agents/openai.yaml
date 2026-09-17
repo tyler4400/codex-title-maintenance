@@ -1,0 +1,4 @@
+interface:
+  display_name: "任务标题维护"
+  short_description: "批量维护 Codex 本机任务标题，支持全量增量扫描、预览与定时启停。"
+  default_prompt: "使用 $codex-title-maintenance 查看维护状态，并按我的要求执行扫描或调整配置。"
