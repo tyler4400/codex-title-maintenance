@@ -13,3 +13,4 @@ state/
 *.sqlite-shm
 *.sqlite3-wal
 *.sqlite3-shm
+/.idea/

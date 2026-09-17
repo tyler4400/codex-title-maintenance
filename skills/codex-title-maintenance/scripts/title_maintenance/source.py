@@ -12,7 +12,9 @@ import hashlib
 import json
 import math
 from pathlib import Path
+import re
 import sqlite3
+import tomllib
 from urllib.parse import quote
 from zoneinfo import ZoneInfo
 
@@ -21,10 +23,58 @@ REQUIRED_COLUMNS = {"id", "rollout_path", "created_at", "updated_at", "source", 
 # The index stores integer Unix seconds, never Unix milliseconds. This upper
 # bound is the last whole second representable by Python's datetime (year 9999).
 MAX_UNIX_SECONDS = 253402300799
+AUTOMATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
 
 
 class SourceError(ValueError):
     """Source data is unavailable, changing, or unsupported."""
+
+
+def read_native_automation(codex_home: Path, automation_id: str) -> dict:
+    """Read an allowlisted view of one persisted native automation.
+
+    This is a point-in-time view of the local TOML file. It does not prove the
+    UI label, scheduler delivery, or the model used by a particular run.
+    """
+    if not isinstance(automation_id, str) or not AUTOMATION_ID.fullmatch(automation_id):
+        raise SourceError("automation_id 格式无效，不能用于读取原生配置")
+    path = Path(codex_home) / "automations" / automation_id / "automation.toml"
+    try:
+        with path.open("rb") as handle:
+            raw = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        raise SourceError(f"无法读取原生 automation {automation_id}: {exc}") from exc
+    if raw.get("id") != automation_id:
+        raise SourceError("原生 automation 文件中的 id 与账本绑定不一致")
+    kind = raw.get("kind")
+    if kind not in {"heartbeat", "cron"}:
+        raise SourceError("原生 automation kind 不受支持")
+    target = raw.get("target")
+    normalized_target = None
+    if isinstance(target, dict):
+        if target.get("type") == "project" and isinstance(target.get("project_id"), str):
+            normalized_target = {"type": "project", "project_id": target["project_id"]}
+        elif target.get("type") == "thread" and isinstance(target.get("thread_id"), str):
+            normalized_target = {"type": "thread", "thread_id": target["thread_id"]}
+    if kind == "heartbeat" and normalized_target is None:
+        thread_id = raw.get("target_thread_id")
+        if isinstance(thread_id, str) and thread_id:
+            normalized_target = {"type": "thread", "thread_id": thread_id}
+    return {
+        "source_path": str(path),
+        "id": automation_id,
+        "kind": kind,
+        "status": raw.get("status") if isinstance(raw.get("status"), str) else None,
+        "rrule": raw.get("rrule") if isinstance(raw.get("rrule"), str) else None,
+        "target": normalized_target,
+        "model": raw.get("model") if isinstance(raw.get("model"), str) else None,
+        "reasoning_effort": (
+            raw.get("reasoning_effort") if isinstance(raw.get("reasoning_effort"), str) else None
+        ),
+        "execution_environment": (
+            raw.get("execution_environment") if isinstance(raw.get("execution_environment"), str) else None
+        ),
+    }
 
 
 def _connect_readonly(path: Path) -> sqlite3.Connection:
@@ -78,9 +128,12 @@ def is_main_task(row: dict) -> bool:
 
     if has_subagent(parsed):
         return False
-    if row.get("thread_source") not in (None, "", "user"):
+    # A standalone cron run is a user-visible top-level task. It may be named
+    # by a later run once it is idle; the live read/write gates protect the
+    # currently running task. Heartbeat and internal rows remain out of scope.
+    if row.get("thread_source") not in (None, "", "user", "automation"):
         return False
-    if isinstance(parsed, str) and parsed.replace("_", "").lower() in {"automation", "heartbeat", "internal"}:
+    if isinstance(parsed, str) and parsed.replace("_", "").lower() in {"heartbeat", "internal"}:
         return False
     return True
 

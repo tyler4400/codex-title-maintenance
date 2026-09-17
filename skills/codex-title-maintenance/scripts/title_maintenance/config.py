@@ -43,6 +43,11 @@ DEFAULT_CONFIG = {
     },
 }
 
+REASONING_EFFORTS = (
+    "inherit", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+)
+NATIVE_REASONING_EFFORTS = tuple(value for value in REASONING_EFFORTS if value != "inherit")
+
 
 def effective_codex_home(optional: str | Path | None = None) -> Path:
     """Resolve the caller's override before CODEX_HOME and the usual default."""
@@ -87,9 +92,7 @@ def validate_config(config: dict) -> None:
     _nonempty_string(agent["model"], "agent.model")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]*", agent["model"]):
         raise ValueError("agent.model 必须是模型标识或 inherit，不能包含空白或控制字符")
-    if not isinstance(agent["reasoning_effort"], str) or agent["reasoning_effort"] not in {
-        "inherit", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
-    }:
+    if not isinstance(agent["reasoning_effort"], str) or agent["reasoning_effort"] not in REASONING_EFFORTS:
         raise ValueError("agent.reasoning_effort 必须为 inherit/none/minimal/low/medium/high/xhigh/max/ultra；宿主支持情况需另行核验")
     schedule = value["schedule"]
     _nonempty_string(schedule["timezone"], "schedule.timezone")
@@ -265,3 +268,37 @@ def schedule_slot(config: dict, now: datetime) -> str | None:
                 if 0 <= elapsed < window:
                     return f"{day.isoformat()}T{slot_time}@{schedule['timezone']}"
     return None
+
+
+def daily_times_from_rrule(rrule: str) -> list[str]:
+    """Normalize the native cron shape supported by this skill.
+
+    The native file is evidence about persisted automation configuration, not
+    a general RRULE parser. Reject extra constraints instead of silently
+    claiming that a more complex rule matches the local daily schedule.
+    """
+    if not isinstance(rrule, str) or not rrule.strip():
+        raise ValueError("原生 cron 缺少可核验的每日计划")
+    fields = {}
+    for part in rrule.split(";"):
+        if "=" not in part:
+            raise ValueError("原生 cron 计划格式不受支持")
+        key, value = part.split("=", 1)
+        key = key.strip().upper()
+        value = value.strip().upper()
+        if not key or not value or key in fields:
+            raise ValueError("原生 cron 计划格式不受支持")
+        fields[key] = value
+    if set(fields) - {"FREQ", "INTERVAL", "BYHOUR", "BYMINUTE"}:
+        raise ValueError("原生 cron 含当前适配器未核验的计划约束")
+    if fields.get("FREQ") != "DAILY" or fields.get("INTERVAL", "1") != "1":
+        raise ValueError("原生 cron 当前只支持每日一次周期定义")
+    try:
+        hours = [int(value) for value in fields["BYHOUR"].split(",")]
+        minutes = [int(value) for value in fields["BYMINUTE"].split(",")]
+    except (KeyError, ValueError) as exc:
+        raise ValueError("原生 cron 缺少有效的小时或分钟") from exc
+    if (not hours or len(hours) != len(set(hours)) or any(not 0 <= value <= 23 for value in hours)
+            or len(minutes) != 1 or not 0 <= minutes[0] <= 59):
+        raise ValueError("原生 cron 的小时或分钟范围不受支持")
+    return [f"{hour:02d}:{minutes[0]:02d}" for hour in sorted(hours)]

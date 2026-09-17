@@ -104,6 +104,152 @@ class Engine:
     def scope_key(self, cfg, excluded):
         return digest({"home": str(self.codex_home), "scope": cfg["scope"], "excluded": sorted(excluded)})
 
+    def _binding_from_db(self, db):
+        binding = self.get(db, "automation_binding")
+        if binding is not None:
+            if not isinstance(binding, dict) or binding.get("version") != 1:
+                raise ValueError("automation binding 格式不受支持；请停止维护并重新核对原生计划。")
+            if (not isinstance(binding.get("automation_id"), str)
+                    or binding.get("kind") not in {"heartbeat", "cron"}
+                    or not isinstance(binding.get("target"), dict)
+                    or not isinstance(binding.get("schedule_hash"), str)):
+                raise ValueError("automation binding 缺少必要身份字段；请停止维护并重新绑定。")
+            target = binding["target"]
+            if binding["kind"] == "heartbeat":
+                if target.get("type") != "thread" or not isinstance(target.get("thread_id"), str):
+                    raise ValueError("heartbeat binding 缺少维护任务 ID。")
+            else:
+                if target.get("type") != "project" or not isinstance(target.get("project_id"), str):
+                    raise ValueError("cron binding 缺少目标项目 ID。")
+                agent = binding.get("native_agent")
+                if (not isinstance(agent, dict) or not isinstance(agent.get("model"), str)
+                        or agent.get("model") == "inherit"
+                        or agent.get("reasoning_effort") not in settings.NATIVE_REASONING_EFFORTS):
+                    raise ValueError("cron binding 缺少原生 model/reasoning 快照。")
+                if (binding.get("execution_environment") != "local"
+                        or not isinstance(binding.get("native_schedule_times"), list)):
+                    raise ValueError("cron binding 缺少原生执行环境或调度快照。")
+            result = dict(binding)
+            result["record_origin"] = "canonical"
+            return result
+        automation_id = self.get(db, "automation_id")
+        thread_id = self.get(db, "maintenance_thread_id")
+        if not automation_id:
+            return None
+        return {
+            "version": 0,
+            "automation_id": automation_id,
+            "kind": "heartbeat" if thread_id else None,
+            "target": {"type": "thread", "thread_id": thread_id} if thread_id else None,
+            "native_agent": None,
+            "execution_environment": None,
+            "native_schedule_times": None,
+            "schedule_hash": self.get(db, "schedule_hash"),
+            "recorded_at": None,
+            "verification": "legacy_meta_inferred_heartbeat" if thread_id else "legacy_meta_incomplete",
+            "record_origin": "legacy",
+        }
+
+    def binding(self, db=None):
+        if db is not None:
+            return self._binding_from_db(db)
+        with self.connect() as connection:
+            return self._binding_from_db(connection)
+
+    @staticmethod
+    def _agent_value_matches(requested, observed):
+        return isinstance(observed, str) and bool(observed) and (
+            requested == "inherit" or requested == observed
+        )
+
+    def _native_automation(self, automation_id):
+        try:
+            raw = source.read_native_automation(self.codex_home, automation_id)
+        except (ValueError, OSError) as exc:
+            return {"observed": False, "automation_id": automation_id, "error": str(exc),
+                    "note": "未读到当前原生落盘配置；这不等于计划不存在或已停止。"}
+        schedule_times, schedule_error = None, None
+        try:
+            schedule_times = settings.daily_times_from_rrule(raw.get("rrule"))
+        except ValueError as exc:
+            schedule_error = str(exc)
+        return {
+            "observed": True,
+            "source": "native_automation_toml",
+            "source_path": raw["source_path"],
+            "automation_id": raw["id"],
+            "kind": raw["kind"],
+            "status": raw["status"],
+            "target": raw["target"],
+            "model": raw["model"],
+            "reasoning_effort": raw["reasoning_effort"],
+            "execution_environment": raw["execution_environment"],
+            "schedule": {"times": schedule_times, "timezone": None, "error": schedule_error},
+            "note": ("这是原生 automation TOML 的当前落盘快照；不证明 UI 标签、调度实际触发，"
+                     "也不证明某次运行实际使用的模型。"),
+        }
+
+    def _sync_checks(self, binding, cfg, native):
+        checks = {
+            "ledger_schedule_snapshot_matches_local_config": (
+                None if not binding else binding.get("schedule_hash") == self.schedule_hash(cfg)
+            ),
+            "native_kind_matches_ledger": None,
+            "native_target_matches_ledger": None,
+            "native_status_active": None,
+            "native_schedule_times_match_local_config": None,
+            "native_schedule_times_match_ledger_snapshot": None,
+            "native_schedule_timezone_verified": None,
+            "native_agent_model_matches_local_config": None,
+            "native_agent_reasoning_effort_matches_local_config": None,
+            "native_agent_model_matches_ledger_snapshot": None,
+            "native_agent_reasoning_effort_matches_ledger_snapshot": None,
+            "native_execution_environment_local": None,
+            "native_execution_environment_matches_ledger_snapshot": None,
+        }
+        notes = {
+            "native_schedule_timezone_verified": (
+                "原生 TOML 未记录独立时区；须由宿主按操作流程核对本机时区，不能由时点匹配推导。"
+            ),
+            "launch_window": "launch_window_minutes 仅由本地扫描入口执行，不是原生计划字段。",
+        }
+        if not binding or not native.get("observed"):
+            return checks, notes
+        checks["native_kind_matches_ledger"] = native.get("kind") == binding.get("kind")
+        checks["native_target_matches_ledger"] = native.get("target") == binding.get("target")
+        checks["native_status_active"] = native.get("status") == "ACTIVE"
+        schedule_times = native.get("schedule", {}).get("times")
+        if schedule_times is not None:
+            checks["native_schedule_times_match_local_config"] = schedule_times == sorted(cfg["schedule"]["times"])
+        snapshot_times = binding.get("native_schedule_times")
+        if isinstance(snapshot_times, list):
+            checks["native_schedule_times_match_ledger_snapshot"] = schedule_times == snapshot_times
+        if binding.get("kind") == "cron":
+            requested = cfg["agent"]
+            snapshot = binding.get("native_agent")
+            checks["native_agent_model_matches_local_config"] = self._agent_value_matches(
+                requested["model"], native.get("model")
+            )
+            checks["native_agent_reasoning_effort_matches_local_config"] = self._agent_value_matches(
+                requested["reasoning_effort"], native.get("reasoning_effort")
+            )
+            if isinstance(snapshot, dict):
+                checks["native_agent_model_matches_ledger_snapshot"] = self._agent_value_matches(
+                    snapshot.get("model"), native.get("model")
+                )
+                checks["native_agent_reasoning_effort_matches_ledger_snapshot"] = self._agent_value_matches(
+                    snapshot.get("reasoning_effort"), native.get("reasoning_effort")
+                )
+            checks["native_execution_environment_local"] = native.get("execution_environment") == "local"
+            if binding.get("execution_environment") is not None:
+                checks["native_execution_environment_matches_ledger_snapshot"] = (
+                    native.get("execution_environment") == binding.get("execution_environment")
+                )
+        else:
+            notes["native_agent"] = "heartbeat 从绑定任务继承模型；应查看 maintenance_thread_model。"
+            notes["native_execution_environment"] = "heartbeat 不使用 cron 的 execution_environment 字段。"
+        return checks, notes
+
     def _needs_full(self, db, cfg, excluded):
         previous = self.get(db, "scan_scope")
         if self.get(db, "watermark") is None or not previous or previous["home"] != str(self.codex_home):
@@ -113,28 +259,117 @@ class Engine:
 
     def excluded(self, db, cfg):
         ids = set(cfg["scope"].get("exclude_thread_ids", []))
-        bound = self.get(db, "maintenance_thread_id")
-        if bound:
-            ids.add(bound)
+        binding = self.binding(db)
+        if binding and binding.get("kind") == "heartbeat" and binding.get("target"):
+            ids.add(binding["target"]["thread_id"])
         return ids
 
-    def bind(self, automation_id, thread_id):
-        if not automation_id.strip() or not thread_id.strip():
-            raise ValueError("绑定需要真实 automation_id 和 thread_id。")
+    def bind(self, automation_id, thread_id=None, *, kind=None, project_id=None,
+             model=None, reasoning_effort=None, execution_environment=None):
+        if not isinstance(automation_id, str) or not source.AUTOMATION_ID.fullmatch(automation_id):
+            raise ValueError("绑定需要格式有效的真实 automation_id。")
+        cfg = self.cfg()
+        legacy = kind is None
+        kind = kind or "heartbeat"
+        if kind == "heartbeat":
+            if not isinstance(thread_id, str) or not thread_id.strip():
+                raise ValueError("heartbeat 绑定需要真实 thread_id。")
+            if any(value is not None for value in (project_id, model, reasoning_effort, execution_environment)):
+                raise ValueError("heartbeat 绑定不能包含 cron 的项目、模型或执行环境字段。")
+            target = {"type": "thread", "thread_id": thread_id}
+        elif kind == "cron":
+            if thread_id is not None:
+                raise ValueError("cron / New chat each run 不绑定固定 maintenance thread。")
+            if not isinstance(project_id, str) or not project_id.strip():
+                raise ValueError("cron 绑定需要真实 project_id。")
+            if not isinstance(model, str) or not model.strip() or model == "inherit":
+                raise ValueError("cron 绑定需要从原生配置读回具体 model，不能使用 inherit。")
+            if reasoning_effort not in settings.NATIVE_REASONING_EFFORTS:
+                raise ValueError("cron reasoning_effort 必须使用原生存储值；low 会原样保留。")
+            if execution_environment != "local":
+                raise ValueError("当前只支持 execution_environment=local 的项目 cron。")
+            target = {"type": "project", "project_id": project_id}
+        else:
+            raise ValueError("automation kind 必须是 heartbeat 或 cron。")
+
+        native = None
+        if not legacy:
+            native = self._native_automation(automation_id)
+            if not native.get("observed"):
+                raise ValueError(native.get("error", "无法核验原生 automation。"))
+            temporary = {"kind": kind, "target": target, "schedule_hash": self.schedule_hash(cfg)}
+            checks, _ = self._sync_checks(temporary, cfg, native)
+            required = [
+                "native_kind_matches_ledger",
+                "native_target_matches_ledger",
+                "native_schedule_times_match_local_config",
+            ]
+            if kind == "cron":
+                required += [
+                    "native_agent_model_matches_local_config",
+                    "native_agent_reasoning_effort_matches_local_config",
+                    "native_execution_environment_local",
+                ]
+                if native.get("model") != model or native.get("reasoning_effort") != reasoning_effort:
+                    raise ValueError("bind 参数中的 cron model/reasoning 与原生读回不一致。")
+            mismatches = [name for name in required if checks.get(name) is not True]
+            if mismatches:
+                raise ValueError("原生 automation 与待绑定身份或本地配置不一致: " + ", ".join(mismatches))
+
+        binding = {
+            "version": 1,
+            "automation_id": automation_id,
+            "kind": kind,
+            "target": target,
+            "native_agent": ({"model": model, "reasoning_effort": reasoning_effort} if kind == "cron" else None),
+            "execution_environment": execution_environment if kind == "cron" else None,
+            "native_schedule_times": (native.get("schedule", {}).get("times") if native else None),
+            "schedule_hash": self.schedule_hash(cfg),
+            "recorded_at": self.stamp(),
+            "verification": "legacy_cli_unverified" if legacy else "native_toml_readback",
+        }
         with self.connect() as db:
+            self.put(db, "automation_binding", binding)
             self.put(db, "automation_id", automation_id)
-            self.put(db, "maintenance_thread_id", thread_id)
-            self.put(db, "schedule_hash", self.schedule_hash(self.cfg()))
-        return {"automation_id": automation_id, "maintenance_thread_id": thread_id}
+            self.put(db, "maintenance_thread_id", thread_id if kind == "heartbeat" else None)
+            self.put(db, "schedule_hash", binding["schedule_hash"])
+        return binding
 
     def control(self, action):
         with self.connect() as db:
             if action == "start":
                 cfg = self.cfg()
-                if not self.get(db, "automation_id") or not self.get(db, "maintenance_thread_id"):
+                binding = self.binding(db)
+                if not binding or not binding.get("kind") or not binding.get("target"):
                     raise ValueError("请先通过 Codex 工具创建或恢复调度、读回确认，然后 bind；脚本不能创建原生调度。")
-                if self.get(db, "schedule_hash") != self.schedule_hash(cfg):
+                if binding.get("schedule_hash") != self.schedule_hash(cfg):
                     raise ValueError("调度配置已变更，须先通过原生工具更新、核对并重新 bind。")
+                native = self._native_automation(binding["automation_id"])
+                if native.get("observed"):
+                    checks, _ = self._sync_checks(binding, cfg, native)
+                    required = [
+                        "native_kind_matches_ledger",
+                        "native_target_matches_ledger",
+                        "native_status_active",
+                        "native_schedule_times_match_local_config",
+                    ]
+                    if binding["kind"] == "cron":
+                        required += [
+                            "native_agent_model_matches_local_config",
+                            "native_agent_reasoning_effort_matches_local_config",
+                            "native_agent_model_matches_ledger_snapshot",
+                            "native_agent_reasoning_effort_matches_ledger_snapshot",
+                            "native_execution_environment_local",
+                            "native_execution_environment_matches_ledger_snapshot",
+                        ]
+                    for snapshot_check in ("native_schedule_times_match_ledger_snapshot",):
+                        if checks.get(snapshot_check) is not None:
+                            required.append(snapshot_check)
+                    mismatches = [name for name in required if checks.get(name) is not True]
+                    if mismatches:
+                        raise ValueError("原生 automation 尚未按账本与配置恢复: " + ", ".join(mismatches))
+                elif binding.get("verification") == "native_toml_readback":
+                    raise ValueError("无法重新读回原生 automation；本地开关保持关闭。")
             self.put(db, "enabled", action == "start")
         return {"enabled": action == "start", "native_scheduler_changed": False,
                 "note": "这是本地开关。完整启停还须由 skill 调用 automation_update 并核对结果。"}
@@ -149,6 +384,65 @@ class Engine:
             raise ValueError("配置已变化，请结束本次运行并重新扫描。")
         db.execute("UPDATE runs SET lease_until=? WHERE id=?", (self.stamp() + 900, run_id))
         return row
+
+    def _scheduled_preflight(self, db, cfg):
+        binding = self.binding(db)
+        if not binding or not binding.get("kind") or not binding.get("target"):
+            return {"skipped": "automation_binding_missing",
+                    "note": "本地账本没有完整的执行模式与目标身份；请读回原生计划后重新 bind。"}
+        if binding.get("schedule_hash") != self.schedule_hash(cfg):
+            return {"skipped": "binding_schedule_stale",
+                    "note": "本地时点或时区已变化；须更新原生计划、读回并重新 bind。"}
+        native = self._native_automation(binding["automation_id"])
+        checks, _ = self._sync_checks(binding, cfg, native)
+        if native.get("observed"):
+            identity_fields = ["native_kind_matches_ledger", "native_target_matches_ledger", "native_status_active"]
+            identity_mismatches = [name for name in identity_fields if checks.get(name) is not True]
+            if identity_mismatches:
+                return {"skipped": "native_automation_identity_mismatch", "fields": identity_mismatches,
+                        "note": "当前原生落盘配置与账本身份或启停状态不一致；未开始扫描。"}
+        elif binding.get("kind") == "cron" or binding.get("verification") == "native_toml_readback":
+            return {"skipped": "native_automation_unavailable", "note": native.get("error")}
+
+        if binding["kind"] == "cron":
+            agent_fields = [
+                "native_agent_model_matches_local_config",
+                "native_agent_reasoning_effort_matches_local_config",
+                "native_agent_model_matches_ledger_snapshot",
+                "native_agent_reasoning_effort_matches_ledger_snapshot",
+            ]
+            agent_mismatches = [name for name in agent_fields if checks.get(name) is not True]
+            if agent_mismatches:
+                return {"skipped": "native_automation_agent_mismatch", "fields": agent_mismatches,
+                        "note": "原生 cron 的 model/reasoning 与本地期望不同；不读取或修改旧维护对话模型。"}
+            other_fields = [
+                "native_schedule_times_match_local_config",
+                "native_schedule_times_match_ledger_snapshot",
+                "native_execution_environment_local",
+                "native_execution_environment_matches_ledger_snapshot",
+            ]
+            other_mismatches = [name for name in other_fields if checks.get(name) is not True]
+            if other_mismatches:
+                return {"skipped": "native_automation_config_mismatch", "fields": other_mismatches,
+                        "note": "原生 cron 的计划或执行环境未通过当前适配器核验。"}
+            return None
+
+        heartbeat_schedule_fields = ["native_schedule_times_match_local_config"]
+        if checks.get("native_schedule_times_match_ledger_snapshot") is not None:
+            heartbeat_schedule_fields.append("native_schedule_times_match_ledger_snapshot")
+        heartbeat_schedule_mismatches = [
+            name for name in heartbeat_schedule_fields if checks.get(name) is not True
+        ]
+        if native.get("observed") and heartbeat_schedule_mismatches:
+            return {"skipped": "native_automation_config_mismatch",
+                    "fields": heartbeat_schedule_mismatches,
+                    "note": "原生 heartbeat 的计划时点与本地配置不一致；未开始扫描。"}
+
+        thread_id = binding["target"]["thread_id"]
+        if self.model_status(thread_id)["matches_persisted_metadata"] is False:
+            return {"skipped": "maintenance_model_mismatch",
+                    "note": "heartbeat 维护任务最近持久化的模型与配置不同；请核对后再开启，不自动升级模型。"}
+        return None
 
     def scan(self, mode="incremental", trigger="manual"):
         cfg = self.cfg()
@@ -167,9 +461,9 @@ class Engine:
                     return {"skipped": "outside_launch_window"}
                 if db.execute("SELECT 1 FROM runs WHERE slot=?", (slot,)).fetchone():
                     return {"skipped": "slot_already_claimed"}
-                if self.model_status()["matches_persisted_metadata"] is False:
-                    return {"skipped": "maintenance_model_mismatch",
-                            "note": "维护任务最近持久化的模型与配置不同；请核对后再开启，不自动升级模型。"}
+                preflight = self._scheduled_preflight(db, cfg)
+                if preflight is not None:
+                    return preflight
             db.execute("UPDATE runs SET status='expired' WHERE status='running' AND lease_until<?", (started,))
             if db.execute("SELECT 1 FROM runs WHERE status='running'").fetchone():
                 return {"skipped": "another_run_is_active"}
@@ -445,28 +739,65 @@ class Engine:
         return {"unprotected": thread_id}
 
     def status(self):
+        cfg = self.cfg()
         with self.connect() as db:
             counts = dict(db.execute("SELECT status,count(*) FROM threads GROUP BY status").fetchall())
             recent = [dict(r) for r in db.execute("""SELECT id,trigger,mode,started_at,status,error,
                 (SELECT count(*) FROM rename_journal j WHERE j.run_id=runs.id AND j.status='confirmed') AS confirmed_renames
                 FROM runs ORDER BY started_at DESC LIMIT 5""")]
             errors = [dict(r) for r in db.execute("SELECT id,status,error FROM threads WHERE error IS NOT NULL LIMIT 20")]
-            return {"enabled": self.get(db, "enabled", False), "automation_id": self.get(db, "automation_id"),
-                    "maintenance_thread_id": self.get(db, "maintenance_thread_id"), "watermark": self.get(db, "watermark"),
-                    "schedule_config_in_sync": self.get(db, "schedule_hash") == self.schedule_hash(self.cfg()),
-                    "counts": counts, "recent_runs": recent, "issues": errors,
-                    "configured_agent": self.cfg()["agent"],
-                    "scheduler_status": "请通过 automation_update view 查询；脚本未访问原生调度。"}
+            enabled = self.get(db, "enabled", False)
+            binding = self.binding(db)
+            watermark = self.get(db, "watermark")
+        native = (
+            self._native_automation(binding["automation_id"])
+            if binding else
+            {"observed": False, "automation_id": None,
+             "note": "账本尚未绑定原生 automation；没有可读取的实际配置。"}
+        )
+        checks, notes = self._sync_checks(binding, cfg, native)
+        maintenance_model = None
+        if binding and binding.get("kind") == "heartbeat" and binding.get("target"):
+            maintenance_model = self.model_status(binding["target"]["thread_id"])
+        maintenance_thread_id = (
+            binding["target"]["thread_id"]
+            if binding and binding.get("kind") == "heartbeat" and binding.get("target") else None
+        )
+        return {
+            # Stable, unambiguous summary fields retained for existing callers.
+            "enabled": enabled,
+            "automation_id": binding.get("automation_id") if binding else None,
+            "maintenance_thread_id": maintenance_thread_id,
+            "watermark": watermark,
+            "counts": counts,
+            "recent_runs": recent,
+            "issues": errors,
+            "configured_agent": cfg["agent"],
+            # The three layers below intentionally have no aggregate in_sync flag.
+            "local_control": {"enabled": enabled},
+            "local_binding": binding,
+            "local_configuration": {
+                "agent": cfg["agent"],
+                "schedule": cfg["schedule"],
+            },
+            "native_automation": native,
+            "sync_checks": checks,
+            "sync_notes": notes,
+            "maintenance_thread_model": maintenance_model,
+        }
 
     def model_status(self, thread_id=None):
         requested = self.cfg()["agent"]
+        binding = None
         if thread_id is None and self.db_path.exists():
-            with self.connect() as db:
-                thread_id = self.get(db, "maintenance_thread_id")
+            binding = self.binding()
+            if binding and binding.get("kind") == "heartbeat" and binding.get("target"):
+                thread_id = binding["target"]["thread_id"]
         result = {"requested": requested, "thread_id": thread_id,
                   "persisted_model": None, "persisted_reasoning_effort": None,
                   "matches_persisted_metadata": None,
-                  "note": "这是最近持久化的任务元数据，不是下一次 heartbeat 实际使用模型的保证。模型配置由 skill 应用于选定维护任务。"}
+                  "execution_mode": binding.get("kind") if binding else ("explicit_thread" if thread_id else None),
+                  "note": "尚未找到可核验的 heartbeat 维护任务模型。"}
         cache = self.codex_home / "models_cache.json"
         if cache.exists():
             try:
@@ -478,8 +809,34 @@ class Engine:
                     result["cached_supported_efforts"] = efforts
             except (ValueError, OSError, AttributeError, TypeError):
                 result["model_cache_status"] = "unavailable"
+        if binding and binding.get("kind") == "cron" and thread_id is None:
+            native = self._native_automation(binding["automation_id"])
+            result["native_automation"] = native
+            result["matches_native_automation_config"] = None
+            result["matches_native_automation_binding"] = None
+            if native.get("observed"):
+                result["matches_native_automation_config"] = (
+                    self._agent_value_matches(requested["model"], native.get("model")) and
+                    self._agent_value_matches(requested["reasoning_effort"], native.get("reasoning_effort"))
+                )
+                snapshot = binding.get("native_agent") or {}
+                result["matches_native_automation_binding"] = (
+                    self._agent_value_matches(snapshot.get("model"), native.get("model")) and
+                    self._agent_value_matches(
+                        snapshot.get("reasoning_effort"), native.get("reasoning_effort")
+                    )
+                )
+            result["note"] = (
+                "cron / New chat each run 不绑定固定维护任务；这里核对的是当前原生 TOML 的 model/reasoning，"
+                "不会读取遗留 maintenance_thread_id。落盘匹配不证明某次运行的实际模型。"
+            )
+            return result
         if not thread_id:
             return result
+        result["note"] = (
+            "这是最近持久化的任务元数据，不是下一次 heartbeat 实际使用模型的保证。"
+            "模型配置由 skill 应用于选定维护任务。"
+        )
         try:
             path = source.discover_database(self.codex_home)
             with closing(sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)) as src:

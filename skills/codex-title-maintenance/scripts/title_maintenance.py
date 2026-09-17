@@ -33,7 +33,13 @@ def parser():
     control.add_argument("action", choices=("start", "stop"))
     bind = sub.add_parser("bind")
     bind.add_argument("--automation-id", required=True)
-    bind.add_argument("--thread-id", required=True)
+    bind.add_argument("--kind", choices=("heartbeat", "cron"),
+                      help="省略时仅兼容旧 --thread-id heartbeat 调用")
+    bind.add_argument("--thread-id")
+    bind.add_argument("--project-id")
+    bind.add_argument("--model")
+    bind.add_argument("--reasoning-effort", choices=config.NATIVE_REASONING_EFFORTS)
+    bind.add_argument("--execution-environment", choices=("local",))
     scan = sub.add_parser("scan")
     scan.add_argument("--mode", choices=("full", "incremental"), default="incremental")
     scan.add_argument("--trigger", choices=("manual", "scheduled"), default="manual")
@@ -113,16 +119,33 @@ def execute(args):
         config.save_config(e.data_dir, after)
         schedule_changed = any(before["schedule"][k] != after["schedule"][k] for k in ("times", "timezone"))
         with e.connect() as db:
-            bound = bool(e.get(db, "automation_id"))
+            binding = e.binding(db)
+        bound = bool(binding)
+        agent_changed = before["agent"] != after["agent"]
+        heartbeat_model_sync = bool(agent_changed and bound and binding.get("kind") == "heartbeat")
+        native_agent_sync = bool(agent_changed and bound and binding.get("kind") == "cron")
         return {"saved": True, "native_schedule_sync_required": schedule_changed and bound,
-                "maintenance_model_sync_required": before["agent"] != after["agent"] and bound,
+                "agent_sync_required": agent_changed and bound,
+                "agent_sync_target": ("maintenance_thread" if heartbeat_model_sync else
+                                      "native_automation" if native_agent_sync else None),
+                "maintenance_thread_model_sync_required": heartbeat_model_sync,
+                "native_agent_sync_required": native_agent_sync,
+                "maintenance_model_sync_required": heartbeat_model_sync,
                 "naming_rules_changed": old_naming_hash != new_naming_hash,
                 "note": ("已绑定计划的时点或时区变更须同步原生 automation；未自动开启维护。" if bound
                          else "已保存；尚未绑定原生计划，下次 start 时应用，当前不会创建或开启计划。")}
     if cmd == "control":
         return e.control(args.action)
     if cmd == "bind":
-        return e.bind(args.automation_id, args.thread_id)
+        return e.bind(
+            args.automation_id,
+            args.thread_id,
+            kind=args.kind,
+            project_id=args.project_id,
+            model=args.model,
+            reasoning_effort=args.reasoning_effort,
+            execution_environment=args.execution_environment,
+        )
     if cmd == "scan":
         return e.scan(args.mode, args.trigger)
     if cmd == "preview":
