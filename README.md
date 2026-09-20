@@ -1,5 +1,7 @@
 # Codex 任务标题维护
 
+[🇨🇳 中文](README.md) | [🇬🇧 English](README.en.md)
+
 [MIT License](LICENSE)
 
 把本机可管理的 Codex 任务统一命名为 `前缀｜短标题｜MMDD`。支持首次全扫、按 `updated_at` 增量扫描、手动预览与扫描、heartbeat 固定任务或 cron “New chat each run” 定时维护，以及可配置的执行模型、时间窗口和命名规则。
