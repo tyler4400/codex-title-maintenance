@@ -8,6 +8,16 @@
 
 用户数据默认在 `${CODEX_HOME}/title-maintenance`，未设置 `CODEX_HOME` 时使用 `~/.codex/title-maintenance`。`CODEX_TITLE_MAINTENANCE_HOME` 可以覆盖数据目录，显式 `--data-dir` 的优先级更高；`--codex-home` 指定待读取的 Codex 数据位置。整个操作必须始终使用同一组路径参数，不能在批次中切换账本。
 
+| 内容 | 保存位置与应用方式 |
+|---|---|
+| 模型、推理强度、时点、时区、显式排除项等偏好 | 用户数据目录的 `config.toml`；通过 `config-apply` 保存，涉及原生计划或任务模型时还需按流程同步 |
+| 命名语义规则 | 用户数据目录的 `naming-rules.md`（或 `title.rules_file` 指定文件） |
+| heartbeat / cron、实际 automation ID、绑定任务或项目 | 原生计划及 `state/state.sqlite3` 中的 `automation_binding`；原生读回后用 `bind` 保存快照 |
+| watermark、待办、外部标题保护、主线摘要、改名 journal | `state/state.sqlite3`；更换维护对话时沿用同一账本 |
+| 精简输出偏好 | 定时运行保存于同一原生 automation 的 prompt，手动运行由当次请求选择；按操作说明使用 `finish --summary` |
+
+个人选择应保存到用户数据目录，不应据此修改安装目录的默认模板。本版没有 `[report]` 或 `[rotation]` 配置表，未知字段会被拒绝；精简输出和换绑使用上述方式，不添加仅有文档示例而无实现的字段。
+
 ## 设置字段
 
 | 字段 | 默认值 | 作用 |
@@ -22,7 +32,7 @@
 | `scope.include_archived` | `true` | 是否纳入归档任务 |
 | `scope.targets` | `codex,chat,work` | 请求管理的数据来源；配置出现不代表适配器已经支持 |
 | `scope.protect_external_titles` | `true` | 外部修改标题时暂停覆盖 |
-| `scope.exclude_thread_ids` | `[]` | 额外排除的任务 ID |
+| `scope.exclude_thread_ids` | `[]` | 用户显式排除的任务 ID，也适用于旧维护任务和已归档任务 |
 | `title.template` | `{prefix}｜{subject}｜{date}` | 标题模板 |
 | `title.date_source` | `latest_assistant` | 日期取最近 assistant 文本消息时间 |
 | `title.date_format` | `%m%d` | 默认得到 `0916` 形式的月日 |
@@ -67,6 +77,8 @@
 ## 配置变更的应用
 
 对结构化设置使用 `config-show` 读取，再通过 `config-apply --file` 提交 JSON 格式的配置补丁。文件是深合并补丁，不是原生自动化配置。保存前验证；保存后再次读取，核对请求的设置。
+
+数组采用整体替换，不能把仅含新增 ID 的数组当作追加操作。向 `scope.exclude_thread_ids` 添加旧维护任务时，先读取原数组、合并新增 ID 并去重，再提交完整数组，保留其他排除项。heartbeat 换绑后只有新目标自动排除，旧目标是否显式排除由用户决定；归档本身不能替代排除。取消排除会扩大范围，下一次扫描可能补做全量发现，但不会重置已有进度。
 
 | 变更 | 后续动作 |
 |---|---|

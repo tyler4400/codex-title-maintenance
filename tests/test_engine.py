@@ -751,6 +751,77 @@ class EngineTests(unittest.TestCase):
         self.assertEqual(result["mode"], "incremental")
         self.assertEqual({item["thread_id"] for item in self.engine.next_items(result["run_id"])["items"]}, {"normal"})
 
+    def test_heartbeat_rotation_preserves_ledger_and_rediscovers_old_maintenance(self):
+        self.add_task("old-maintenance", archived=True, updated=int(self.time.timestamp()) - 7200)
+        self.add_task("new-maintenance")
+        self.add_task("protected")
+        self.add_task("pending")
+        self.write_heartbeat_automation(thread_id="old-maintenance")
+        self.engine.bind("fixture-heartbeat", "old-maintenance", kind="heartbeat")
+        self.initial_rename("protected")
+        self.time += timedelta(hours=2)
+        self.set_source("protected", title="人工标题", updated_at=int(self.time.timestamp()))
+        run_id = self.start()
+        self.assertTrue(self.engine.propose(run_id, "protected", self.live("protected"))["protected"])
+        proposal = self.proposal(run_id, "pending")
+        self.engine.authorize(run_id, proposal["intent_id"], self.live("pending"))
+        self.engine.finish(run_id)
+        before = self.engine.status()
+        with self.engine.connect() as db:
+            saved = {table: [dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY id")]
+                     for table in ("threads", "runs", "rename_journal")}
+
+        self.engine.control("stop")
+        self.write_heartbeat_automation(thread_id="new-maintenance", status="PAUSED")
+        self.engine.bind("fixture-heartbeat", "new-maintenance", kind="heartbeat")
+        after = self.engine.status()
+        self.assertEqual(after["watermark"], before["watermark"])
+        self.assertEqual(after["counts"], before["counts"])
+        self.assertEqual(after["automation_id"], before["automation_id"])
+        self.assertEqual(after["maintenance_thread_id"], "new-maintenance")
+        with self.engine.connect() as db:
+            for table, rows in saved.items():
+                self.assertEqual([dict(row) for row in db.execute(f"SELECT * FROM {table} ORDER BY id")], rows)
+        self.write_heartbeat_automation(thread_id="new-maintenance")
+        self.engine.control("start")
+
+        self.time += timedelta(hours=2)
+        result = self.engine.scan()
+        self.assertEqual(result["mode"], "full")
+        items = {item["thread_id"]: item for item in self.engine.next_items(result["run_id"])["items"]}
+        self.assertEqual(set(items), {"old-maintenance", "pending"})
+        self.assertTrue(items["old-maintenance"]["archived"])
+        self.assertEqual(items["pending"]["action"], "recover")
+        self.assertEqual(items["pending"]["intent_id"], proposal["intent_id"])
+        self.assertEqual(self.live("protected")["title"], "人工标题")
+
+    def test_rotation_explicitly_excludes_archived_old_thread_and_preserves_other_exclusions(self):
+        self.add_task("old-maintenance", archived=True, updated=int(self.time.timestamp()) - 7200)
+        self.add_task("new-maintenance")
+        self.add_task("already-excluded", archived=True, thread_source="automation")
+        self.add_task("normal")
+        cfg = self.engine.cfg()
+        cfg["scope"]["exclude_thread_ids"] = ["already-excluded"]
+        config.save_config(self.data, cfg)
+        self.write_heartbeat_automation(thread_id="old-maintenance", status="PAUSED")
+        self.engine.bind("fixture-heartbeat", "old-maintenance", kind="heartbeat")
+        self.engine.finish(self.start())
+
+        patch_file = self.base / "exclusion-patch.json"
+        excluded = list(dict.fromkeys(self.engine.cfg()["scope"]["exclude_thread_ids"] + ["old-maintenance"]))
+        patch_file.write_text(json.dumps({"scope": {"exclude_thread_ids": excluded}}), encoding="utf-8")
+        result = self.cli("config-apply", "--file", str(patch_file))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.write_heartbeat_automation(thread_id="new-maintenance", status="PAUSED")
+        self.engine.bind("fixture-heartbeat", "new-maintenance", kind="heartbeat")
+        self.assertEqual(self.engine.cfg()["scope"]["exclude_thread_ids"], ["already-excluded", "old-maintenance"])
+        self.time += timedelta(hours=2)
+        result = self.engine.scan()
+        self.assertEqual(result["mode"], "incremental")
+        self.assertEqual({item["thread_id"] for item in self.engine.next_items(result["run_id"])["items"]}, {"normal"})
+        self.assertIsNone(self.row("threads", "id", "old-maintenance"))
+        self.assertIsNone(self.row("threads", "id", "already-excluded"))
+
     def test_enabling_archived_scope_forces_full_discovery_of_old_tasks(self):
         self.add_task("old-archived", archived=True, updated=int(self.time.timestamp()) - 7200)
         cfg = self.engine.cfg()
@@ -801,6 +872,107 @@ class EngineTests(unittest.TestCase):
         end = self.cli("finish", "--run-id", run_id)
         self.assertEqual(end.returncode, 0, end.stderr)
         self.assertEqual(json.loads(end.stdout)["result"]["recent_runs"][0]["status"], "finished")
+
+    def test_finish_summary_distinguishes_confirmed_work_from_remaining_ledger_items(self):
+        self.add_task("protected")
+        self.initial_rename("protected")
+        self.time += timedelta(hours=2)
+        self.set_source("protected", title="人工标题", updated_at=int(self.time.timestamp()))
+        for task_id in ("confirmed", "deferred", "broken", "pending", "prepared", "dispatched"):
+            self.add_task(task_id)
+        self.add_task("unchanged", title="探索｜本地任务标题维护方案｜0917")
+        run_id = self.start()
+        self.apply_fixture(run_id, self.proposal(run_id, "confirmed"))
+        self.assertTrue(self.proposal(run_id, "unchanged")["unchanged"])
+        self.assertTrue(self.engine.propose(run_id, "protected", self.live("protected"))["protected"])
+        self.engine.defer(run_id, "deferred", "任务仍在运行")
+        self.proposal(run_id, "prepared")
+        dispatched = self.proposal(run_id, "dispatched")
+        self.engine.authorize(run_id, dispatched["intent_id"], self.live("dispatched"))
+        (self.home / "broken.jsonl").unlink()
+        self.engine.next_items(run_id, limit=100)
+        watermark = self.engine.status()["watermark"]
+
+        summary = self.engine.finish(run_id, summary=True)
+        self.assertEqual(summary["run_id"], run_id)
+        self.assertEqual(summary["status"], "finished")
+        self.assertEqual(summary["confirmed_renames"], 1)
+        self.assertEqual(summary["deferred_this_run"], 1)
+        self.assertEqual(summary["ledger_remaining"], {
+            "pending": 3, "deferred": 1, "error": 1, "protected": 1, "unconfirmed_writes": 2,
+        })
+        self.assertEqual(summary["issue_count"], 2)
+        self.assertEqual({item["id"] for item in summary["issues"]}, {"broken", "protected"})
+        self.assertTrue(all(item["error"] for item in summary["issues"]))
+        for field in ("recent_runs", "local_configuration", "native_automation", "sync_checks"):
+            self.assertNotIn(field, summary)
+        status = self.engine.status()
+        self.assertEqual(status["watermark"], watermark)
+        self.assertEqual(status["counts"]["done"], 2)
+        self.assertIn("sync_checks", status)
+        with self.engine.connect() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM contexts WHERE run_id=?", (run_id,)).fetchone()[0], 0)
+        self.assertIn("run_id", self.engine.scan())
+
+    def test_finish_summary_keeps_recovered_intent_attributed_to_original_run(self):
+        self.add_task()
+        first = self.start()
+        proposal = self.proposal(first)
+        self.engine.authorize(first, proposal["intent_id"], self.live())
+        self.set_source("task-a", title=proposal["new_title"])
+        initial = self.engine.finish(first, summary=True)
+        self.assertEqual(initial["confirmed_renames"], 0)
+        self.assertEqual(initial["ledger_remaining"]["unconfirmed_writes"], 1)
+        second = self.start()
+        self.engine.confirm(second, proposal["intent_id"], self.live(), recovery=True)
+        recovered = self.engine.finish(second, summary=True)
+        self.assertEqual(recovered["confirmed_renames"], 0)
+        self.assertEqual(recovered["ledger_remaining"]["unconfirmed_writes"], 0)
+        runs = {run["id"]: run for run in self.engine.status()["recent_runs"]}
+        self.assertEqual(runs[first]["confirmed_renames"], 1)
+
+    def test_finish_summary_bounds_issue_details_without_hiding_total(self):
+        for number in range(7):
+            task_id = self.add_task(f"broken-{number}")
+            (self.home / f"{task_id}.jsonl").unlink()
+        run_id = self.start()
+        self.assertEqual(self.engine.next_items(run_id)["items"], [])
+        summary = self.engine.finish(run_id, summary=True)
+        self.assertEqual(summary["issue_count"], 7)
+        self.assertEqual(summary["ledger_remaining"]["error"], 7)
+        self.assertEqual([item["id"] for item in summary["issues"]], [f"broken-{number}" for number in range(5)])
+
+    def test_finish_summary_preserves_run_guard_and_allows_stopped_run_cleanup(self):
+        self.add_task()
+        self.enable()
+        run_id = self.start(trigger="scheduled")
+        self.engine.control("stop")
+        cfg = self.engine.cfg()
+        cfg["schedule"]["times"] = ["14:00"]
+        config.save_config(self.data, cfg)
+        self.assertEqual(self.engine.finish(run_id, summary=True)["status"], "finished")
+        run_id = self.start()
+        self.time += timedelta(minutes=16)
+        for invalid_id in ("missing-run", run_id):
+            with self.subTest(run_id=invalid_id), self.assertRaises(ValueError):
+                self.engine.finish(invalid_id, summary=True)
+        self.assertEqual(self.row("runs", "id", run_id)["status"], "running")
+
+    def test_cli_finish_summary_is_optional_and_status_remains_available(self):
+        self.add_task()
+        scan = self.cli("scan")
+        self.assertEqual(scan.returncode, 0, scan.stderr)
+        run_id = json.loads(scan.stdout)["result"]["run_id"]
+        end = self.cli("finish", "--run-id", run_id, "--summary")
+        self.assertEqual(end.returncode, 0, end.stderr)
+        summary = json.loads(end.stdout)["result"]
+        self.assertEqual(summary["run_id"], run_id)
+        self.assertEqual(summary["status"], "finished")
+        self.assertEqual(summary["ledger_remaining"]["pending"], 1)
+        self.assertNotIn("recent_runs", summary)
+        status = self.cli("status")
+        self.assertEqual(status.returncode, 0, status.stderr)
+        self.assertIn("recent_runs", json.loads(status.stdout)["result"])
 
     def test_cli_invalid_configuration_fails_without_overwriting_previous_settings(self):
         before = (self.data / "config.toml").read_bytes()

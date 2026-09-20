@@ -724,11 +724,40 @@ class Engine:
             self._defer(db, run_id, thread_id, reason)
         return {"deferred": thread_id, "reason": reason}
 
-    def finish(self, run_id):
+    def finish(self, run_id, *, summary=False):
         with self.connect() as db:
             self._run(db, run_id, allow_disabled=True, check_config=False)
             db.execute("UPDATE runs SET status='finished' WHERE id=?", (run_id,))
             db.execute("DELETE FROM contexts WHERE run_id=?", (run_id,))
+            if summary:
+                counts = dict(db.execute("SELECT status,count(*) FROM threads GROUP BY status").fetchall())
+                # Journal ownership stays with the run that created the intent,
+                # including when a later run confirms it through recovery.
+                confirmed = db.execute(
+                    "SELECT count(*) FROM rename_journal WHERE run_id=? AND status='confirmed'",
+                    (run_id,),
+                ).fetchone()[0]
+                deferred = db.execute(
+                    "SELECT count(*) FROM threads WHERE last_run=? AND status='deferred'", (run_id,),
+                ).fetchone()[0]
+                unconfirmed = db.execute(
+                    "SELECT count(*) FROM rename_journal WHERE status IN ('prepared','dispatched')"
+                ).fetchone()[0]
+                issues = [dict(row) for row in db.execute(
+                    "SELECT id,status,error FROM threads WHERE status IN ('error','protected') ORDER BY id LIMIT 5"
+                )]
+                return {
+                    "run_id": run_id,
+                    "status": "finished",
+                    "confirmed_renames": confirmed,
+                    "deferred_this_run": deferred,
+                    "ledger_remaining": {
+                        **{status: counts.get(status, 0) for status in ("pending", "deferred", "error", "protected")},
+                        "unconfirmed_writes": unconfirmed,
+                    },
+                    "issues": issues,
+                    "issue_count": counts.get("error", 0) + counts.get("protected", 0),
+                }
         return self.status()
 
     def unprotect(self, thread_id):

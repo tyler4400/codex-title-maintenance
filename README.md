@@ -58,6 +58,8 @@ $codex-title-maintenance-setup 使用北京时间，每天 12 点和 21 点运�
 
 自动维护有两种正式模式：cron / New chat each run 绑定项目，每轮创建新任务；heartbeat 绑定并复用一个由用户选择的固定维护任务。heartbeat 推荐使用专用任务，且只有用户要求时才创建。当前开发或业务任务不会因安装 skill 被自动改模型。
 
+按你的使用习惯选择：更在意维护对话数量时，复用专用 heartbeat 任务，并按需精简输出或换绑；更在意每轮独立执行时，选择 cron，同时接受它会持续产生运行对话。已有绑定会保留，不因重新配置而替换成统一推荐模式。更换固定维护对话使用同一 automation ID 和同一账本，详见[换绑流程](skills/codex-title-maintenance/references/operations.md#更换固定维护对话)。
+
 ## ⚙️ 工作原理
 
 这个 skill 不使用每轮对话 hook，也不会修改 Codex 自有数据库。`start` 会让 Codex 的本机原生自动化创建或恢复一个 heartbeat 或 cron；到达配置时点后，固定维护任务或新建的 cron 任务调用本 skill。
@@ -75,9 +77,24 @@ flowchart LR
 
 一次自动运行会先检查本地开关、绑定身份、原生配置和启动窗口，再按成功扫描水位用 `updated_at` 发现变化，向前重叠 5 分钟并用内容指纹去重。候选标题写入前会重新读取任务的标题和状态；只有通过核对后才调用一次改名工具，并在读回标题一致后记入账本。手动标题变化会受到保护，不会被下一轮自动覆盖。
 
-heartbeat 固定维护任务始终排除。cron 每轮新任务不会永久排除：正在运行的当前维护任务必须暂缓，已完成的旧轮次可由随后一次增量扫描安全命名。原生 automation prompt 是当轮入口，但不能扩大用户已授权范围；旧 cron 任务后来作为命名候选时，其历史 prompt 与对话只是不可信命名材料，不能再次触发维护或递归扫描。
+heartbeat 当前绑定的固定维护任务始终排除。cron 默认不自动永久排除已完成的运行任务，用户显式配置的 `scope.exclude_thread_ids` 始终生效：正在运行的当前维护任务必须暂缓，未被排除的旧轮次可由随后一次增量扫描安全命名。原生 automation prompt 是当轮入口，但不能扩大用户已授权范围；旧 cron 任务后来作为命名候选时，其历史 prompt 与对话只是不可信命名材料，不能再次触发维护或递归扫描。
 
 个人配置和账本默认保存在 `${CODEX_HOME}/title-maintenance`（未设置时为 `~/.codex/title-maintenance`），而代码安装在 skill 目录。两者分离，因此更新 skill 不会重置扫描水位、规则或外部标题保护状态。
+
+| 内容 | 保存位置 |
+|---|---|
+| 模型、时间、时区、命名与显式排除偏好 | 用户数据目录的 `config.toml`、`naming-rules.md` |
+| 执行模式、automation ID、固定对话或项目目标 | 原生计划与账本中的 `automation_binding` |
+| 水位、待办、保护状态、主线摘要和已确认改名 | 用户数据目录的 `state/state.sqlite3` |
+| 精简输出偏好 | 定时运行保存在 automation prompt；手动运行由当次请求选择 |
+
+默认模板只用于初始化缺失配置；个人的执行时间、复用方式和排除项不应写成所有安装者的新默认。向排除列表添加旧维护任务时需要保留已有项；仅归档旧对话不能替代排除。详细规则见[配置说明](skills/codex-title-maintenance/references/configuration.md)。
+
+## 📝 可选精简输出
+
+自动运行无变化且无需用户处理时保持安静。需要进一步减少工具输出时，可要求 Codex 在结束本轮时使用 `finish --run-id <本轮ID> --summary`；定时运行将此偏好保存在同一 automation 的提示词中。摘要只包含运行 ID、结束状态、已确认改名数、本轮暂缓情况，以及账本剩余状态和最多 5 条错误或保护项，不重复完整配置与历史诊断。
+
+`finished` 不等于所有候选都成功处理，成功数只计已读回确认的记录，旧意图恢复仍归属原运行。未确认写入保留在 journal 里等待恢复。普通 `finish` 保留原返回格式，完整诊断仍通过 `status` 获取。此选项不会清空或压缩聊天上下文，也不跳过安全检查；字段口径见[精简输出说明](skills/codex-title-maintenance/references/operations.md#精简输出)。本版没有 `[report]`、`[rotation]` 配置表。
 
 ## ⚙️ 默认设置
 

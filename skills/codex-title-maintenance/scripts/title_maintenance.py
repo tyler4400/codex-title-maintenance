@@ -73,6 +73,7 @@ def parser():
     defer.add_argument("--reason", required=True)
     finish = sub.add_parser("finish")
     finish.add_argument("--run-id", required=True)
+    finish.add_argument("--summary", action="store_true", help="仅返回结束摘要；完整诊断仍可用 status 查看")
     unprotect = sub.add_parser("unprotect")
     unprotect.add_argument("--thread-id", required=True)
     return p
@@ -167,7 +168,7 @@ def execute(args):
     if cmd == "defer":
         return e.defer(args.run_id, args.thread_id, args.reason)
     if cmd == "finish":
-        return e.finish(args.run_id)
+        return e.finish(args.run_id, summary=args.summary)
     if cmd == "unprotect":
         return e.unprotect(args.thread_id)
     raise ValueError("未知命令。")
