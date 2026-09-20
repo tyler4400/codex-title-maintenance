@@ -1,6 +1,7 @@
 # Codex 任务标题维护
 
 [🇨🇳 中文](README.md) | [🇬🇧 English](README.en.md)
+<img width="2400" height="1600" alt="codex-before-after" src="https://github.com/user-attachments/assets/6ccbdc82-0ad6-43c9-9355-6707f3ac649f" />
 
 [MIT License](LICENSE)
 
